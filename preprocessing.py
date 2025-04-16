@@ -22,10 +22,10 @@ from sklearn.metrics import roc_auc_score
 from category_encoders.ordinal import OrdinalEncoder
 from category_encoders.target_encoder import TargetEncoder
 
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
-from pyspark.sql.functions import pandas_udf, col
+from pyspark.sql import SparkSession, DataFrame # type: ignore
+from pyspark.sql import functions as F # type: ignore
+from pyspark.sql import types as T # type: ignore
+from pyspark.sql.functions import pandas_udf, col # type: ignore
 
 from feature_selector import FeatureSelector
 from corr_feature_remover import CorrFeatureRemover
@@ -913,7 +913,7 @@ class PreprocessingPipeline:
 
 
 if __name__ == '__main__':
-    from campaignds.sc_connector import SparkHelper
+    from campaignds.sc_connector import SparkHelper # type: ignore
 
     helper = SparkHelper(
         dynamicAllocation='True',
