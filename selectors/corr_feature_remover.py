@@ -5,11 +5,11 @@ import lightgbm as lgbm
 from multiprocessing import Pool
 import multiprocessing
 
-import pyspark.sql.functions as F
-import pyspark.sql.types as T
+import pyspark.sql.functions as F # type: ignore
+import pyspark.sql.types as T # type: ignore
 from sklearn.metrics import roc_auc_score
 
-from feature_selector import FeatureSelector
+from preprocessing import FeatureSelector
 
 
 class CorrFeatureRemover(FeatureSelector):

@@ -1,11 +1,11 @@
 import numpy as np
 import pandas as pd
-import pyspark.sql.functions as F
-from pyspark.sql import DataFrame
+import pyspark.sql.functions as F # type: ignore
+from pyspark.sql import DataFrame # type: ignore
 import lightgbm as lgbm
 from sklearn.metrics import roc_auc_score
 
-from feature_selector import FeatureSelector
+from preprocessing import FeatureSelector
 
 
 class ForwardFeatureSelector(FeatureSelector):

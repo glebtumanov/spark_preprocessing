@@ -6,11 +6,11 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgbm
 
-import pyspark.sql.functions as F
-from pyspark.sql import DataFrame
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+import pyspark.sql.functions as F # type: ignore
+from pyspark.sql import DataFrame # type: ignore
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType # type: ignore
 
-from feature_selector import FeatureSelector
+from preprocessing import FeatureSelector
 
 
 class AdversarialFeatureRemover(FeatureSelector):

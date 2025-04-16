@@ -1,3 +1,7 @@
+# Важно: для target_encoder и catboost_encoder требуется category_encoders >= 2.6.0
+# Для Spark ML требуется pyspark >= 3.0.0
+# Для Arrow требуется pyarrow >= 2.0.0
+
 common:
     index_col: "epk_id"
     target_col: "target" # TODO сделать необязательным
@@ -16,10 +20,10 @@ artifacts:
 
 result:
     format: "parquet" # hive, parquet
-    save_path: "/home/gleb/data/results" # path для parquet или имя таблицы для hive
     format_scoring: "hive" # hive, parquet
-    save_path_scoring: "arnsdpsbx_t_team_cvm" # путь для parquet или имя таблицы для hive
-    suffix: "_for_sota" # общий суффикс для всех сохраняемых данных
+    train_save_path: "/home/gleb/data/results/train.parquet" # путь для parquet или имя таблицы для hive как указано в format
+    test_save_path: "/home/gleb/data/results/test.parquet" # путь для parquet или имя таблицы для hive как указано в format
+    scoring_save_path: "arnsdpsbx_t_team_cvm" # путь для parquet или имя таблицы для hive как указано в format_scoring
 
 preprocessing:
     rebalancing:
@@ -32,12 +36,19 @@ preprocessing:
     deduplicate:
         subset: ["epk_id"]
     categorical_encoding:
+        # label_encoder: Spark ML StringIndexer (распределённый, сохраняется через .write().save())
+        # target_encoder: category_encoders.TargetEncoder (pandas, сохраняется через pickle)
+        # catboost_encoder: category_encoders.CatBoostEncoder (pandas, сохраняется через pickle)
         force_categorical: []
         method: "label_encoder" # варианты: "label_encoder", "target_encoder"
         sample_size: null
     scaling:
-        method: "standard"  # варианты: "standard", "minmax", "quantile", "binning" и т.п.
-        bins: 10            # если выбран binning, это кол-во бинов
+        # standard: Spark ML StandardScaler (распределённый, сохраняется через .write().save())
+        # minmax: Spark ML MinMaxScaler (распределённый, сохраняется через .write().save())
+        # quantile: sklearn QuantileTransformer (pandas, сохраняется через pickle)
+        # binning: sklearn KBinsDiscretizer (pandas, сохраняется через pickle)
+        method: "standard"
+        bins: 10 # если выбран binning, это кол-во бинов
         sample_size: null
     drop_correlated:
         threshold: 0.95

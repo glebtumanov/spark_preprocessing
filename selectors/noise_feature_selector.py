@@ -1,12 +1,12 @@
 import os
 import numpy as np
 import pandas as pd
-import pyspark.sql.functions as F
-import pyspark.sql.types as T
+import pyspark.sql.functions as F # type: ignore
+import pyspark.sql.types as T # type: ignore
 import lightgbm as lgbm
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame # type: ignore
 
-from feature_selector import FeatureSelector
+from preprocessing import FeatureSelector
 
 
 class NoiseFeatureSelector(FeatureSelector):
