@@ -1,0 +1,95 @@
+common:
+    index_col: "epk_id"
+    target_col: "target" # TODO сделать необязательным
+    skip_cols: ["income", "city_mlnr"]
+    force_drop_cols: ["tags"]
+    n_jobs: -1
+
+sampling:
+    train_sample_size: 1000000
+    test_sample_size: 1000000
+    use_sampling: true   # Если поставить false, то сэмплирование делать не будем
+
+artifacts:
+    path: "/home/gleb/data/artifacts_for_sota"
+    clear: false
+
+result:
+    format: "parquet" # hive, parquet
+    save_path: "/home/gleb/data/results" # path для parquet или имя таблицы для hive
+    format_scoring: "hive" # hive, parquet
+    save_path_scoring: "arnsdpsbx_t_team_cvm" # путь для parquet или имя таблицы для hive
+    suffix: "_for_sota" # общий суффикс для всех сохраняемых данных
+
+preprocessing:
+    rebalancing:
+        positive_frac: 0.3
+    drop_uninformative:
+        threshold: 0.99
+    missing_values:
+        numeric: 0
+        categorical: "NA"
+    deduplicate:
+        subset: ["epk_id"]
+    categorical_encoding:
+        force_categorical: []
+        method: "label_encoder" # варианты: "label_encoder", "target_encoder"
+        sample_size: null
+    scaling:
+        method: "standard"  # варианты: "standard", "minmax", "quantile", "binning" и т.п.
+        bins: 10            # если выбран binning, это кол-во бинов
+        sample_size: null
+    drop_correlated:
+        threshold: 0.95
+        sample_size: 100000
+        importances:
+            use_shap: true
+            sample_size: 50000
+            n_partitions: 8
+            learning_rate: 0.05
+            early_stopping_rounds: 10
+    drop_adversarial:
+        sample_size: 100000
+        target_metric_value: 0.68
+        cv_folds: 16
+        learning_rate: 0.04
+        max_features_to_remove: 100
+        max_time: 3600
+        num_boost_round: 250
+        importance_type: "gain" # split gain shap
+    noise_selection:
+        cv_folds: 16
+        selection_rate: 0.3
+        sample_size: null
+        num_boost_round: 100
+        learning_rate: 0.05
+        seed: 43
+        importance_type: "shap" # split gain shap
+    forward_selection:
+        sample_size: null
+        cv_folds_importances: 8
+        cv_folds_selection: 8
+        num_boost_round_importances: 1000
+        num_boost_round_selection: 300
+        learning_rate: 0.05
+        valid_frac: 0.3
+        seed: 43
+        importance_type: "gain" # split gain shap
+        eps: 0.00001 # на сколько должна улучшиться метрика для принятия фичи (или не упасть если votes_only=True)
+        q: 4
+        tol: 50
+        votes_only: true
+
+pipeline_steps:
+    - rebalancing
+    - drop_forced_cols
+    - convert_decimal
+    - fill_missing
+    - drop_uninformative
+    - deduplicate
+    - categorical_encoding
+    - scaling
+    - drop_correlated
+    - drop_adversarial
+    - noise_selection
+    - forward_selection
