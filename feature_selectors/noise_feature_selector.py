@@ -1,12 +1,11 @@
 import os
 import numpy as np
 import pandas as pd
-import pyspark.sql.functions as F
-import pyspark.sql.types as T
+import pyspark.sql.functions as F # type: ignore
+import pyspark.sql.types as T # type: ignore
+from pyspark.sql import DataFrame # type: ignore
 import lightgbm as lgbm
-from pyspark.sql import DataFrame
 from sklearn.metrics import roc_auc_score, mean_squared_error
-
 from .base_feature_selector import BaseFeatureSelector
 
 

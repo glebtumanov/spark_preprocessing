@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
-import pyspark.sql.functions as F
-from pyspark.sql import DataFrame
+import pyspark.sql.functions as F # type: ignore
+from pyspark.sql import DataFrame # type: ignore
 import lightgbm as lgbm
 from sklearn.metrics import roc_auc_score, mean_squared_error
 
@@ -19,7 +19,7 @@ def get_task_config(task_type):
     elif task_type == "regression":
         return {
             'objective': 'regression',
-            'metric': 'rmse', 
+            'metric': 'rmse',
             'eval_metric': lambda y_true, y_pred: -mean_squared_error(y_true, y_pred, squared=False),  # Используем негативный RMSE, поэтому больше = лучше
         }
     else:
@@ -70,7 +70,7 @@ class ForwardFeatureSelector(BaseFeatureSelector):
 
         self.target_col = config["common"]["target_col"]
         self.task_type = config["common"].get("task_type", "binary_classification")
-        
+
         # Получаем конфигурацию для типа задачи
         task_config = get_task_config(self.task_type)
 
@@ -110,7 +110,7 @@ class ForwardFeatureSelector(BaseFeatureSelector):
             'min_sum_hessian_in_leaf': 1.0,
             'early_stopping_rounds': 100
         }
-        
+
         # Сохраняем функцию оценки
         self.eval_metric = task_config['eval_metric']
 

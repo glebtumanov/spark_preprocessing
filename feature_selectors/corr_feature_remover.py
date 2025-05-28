@@ -5,8 +5,8 @@ import lightgbm as lgbm
 from multiprocessing import Pool
 import multiprocessing
 
-import pyspark.sql.functions as F
-import pyspark.sql.types as T
+import pyspark.sql.functions as F # type: ignore
+import pyspark.sql.types as T # type: ignore
 from sklearn.metrics import roc_auc_score, mean_squared_error
 
 from .base_feature_selector import BaseFeatureSelector
@@ -138,7 +138,7 @@ class CorrFeatureRemover(BaseFeatureSelector):
 
         # Получаем конфигурацию для типа задачи
         task_config = get_task_config(self.task_type)
-        
+
         # Параметры LightGBM
         lgb_params = {
             'num_boost_round': 200,
@@ -203,7 +203,7 @@ class CorrFeatureRemover(BaseFeatureSelector):
 
         # Получаем конфигурацию для типа задачи
         task_config = get_task_config(self.task_type)
-        
+
         lgb_params = {
             'num_boost_round': 200,
             'objective': task_config['objective'],

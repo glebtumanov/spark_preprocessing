@@ -22,17 +22,18 @@ from sklearn.metrics import roc_auc_score, mean_squared_error
 from category_encoders.ordinal import OrdinalEncoder
 from category_encoders.target_encoder import TargetEncoder
 
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
-from pyspark.sql import types as T
-from pyspark.sql.functions import pandas_udf, col
+from pyspark.sql import DataFrame # type: ignore
+from pyspark.sql import functions as F # type: ignore
+from pyspark.sql import types as T # type: ignore
+from pyspark.sql.functions import pandas_udf, col # type: ignore
 
 from feature_selectors import (
     BaseFeatureSelector,
     CorrFeatureRemover,
     AdversarialFeatureRemover,
     NoiseFeatureSelector,
-    ForwardFeatureSelector
+    ForwardFeatureSelector,
+    PermutationSelector
 )
 
 sklearn.set_config(transform_output='pandas')
@@ -205,6 +206,7 @@ class PreprocessingPipeline:
             "drop_adversarial_cols_path": None,
             "noise_excluded_cols_path": None,
             "fs_excluded_cols_path": None,
+            "permutation_excluded_cols_path": None,
             "encoder_path": None,
             "scaler_path": None
         }
@@ -738,6 +740,41 @@ class PreprocessingPipeline:
             # Обновляем списки колонок
             self._remove_cols_from_lists(features_to_exclude)
 
+    def select_permutation(self):
+        """Отбор признаков с помощью permutation importance"""
+        self._check_data_loaded()
+        selector = PermutationSelector(self.config, self.sc)
+
+        # Получаем список признаков для включения
+        features_to_include = selector.get_features_to_include(
+            train_sdf=self.train_sdf,
+            test_sdf=None,
+            features=self.final_features_list,
+            categorical_features=self.cat_cols
+        )
+
+        # Получаем список признаков для исключения
+        features_to_exclude = [col for col in self.final_features_list if col not in features_to_include]
+
+        if features_to_exclude:
+            print(f"[select_permutation] Удаляем колонки: {len(features_to_exclude)}")
+
+            # Удаляем колонки из всех датасетов
+            if self.train_sdf is not None:
+                self.train_sdf = self.train_sdf.drop(*features_to_exclude)
+            if self.test_sdf is not None:
+                self.test_sdf = self.test_sdf.drop(*features_to_exclude)
+            if self.scoring_sdf is not None:
+                self.scoring_sdf = self.scoring_sdf.drop(*features_to_exclude)
+
+            # Сохраняем список исключенных признаков
+            path = os.path.join(self.artifacts_path, "permutation_excluded_cols.txt")
+            save_columns(features_to_exclude, path)
+            self.artifacts_info["permutation_excluded_cols_path"] = path
+
+            # Обновляем списки колонок
+            self._remove_cols_from_lists(features_to_exclude)
+
     # ============ Вспомогательные методы ============
 
     def _init_column_lists(self):
@@ -932,7 +969,8 @@ class PreprocessingPipeline:
         "drop_correlated": drop_correlated,
         "drop_adversarial": drop_adversarial,
         "noise_selection": select_noise,
-        "forward_selection": select_forward
+        "forward_selection": select_forward,
+        "permutation_selection": select_permutation
     }
 
 

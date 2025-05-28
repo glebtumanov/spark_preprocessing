@@ -80,6 +80,16 @@ preprocessing:
         q: 4
         tol: 50
         votes_only: true
+    permutation_selection:
+        cv_folds: 5
+        selection_rate: 0.7
+        min_importance_threshold: 0.001
+        learning_rate: 0.05
+        sample_size: null
+        num_boost_round: 100
+        seed: 42
+        valid_frac: 0.3
+        permutation_repeats: 1
 
 pipeline_steps:
     - rebalancing
@@ -106,3 +116,4 @@ pipeline_steps:
 #     - drop_adversarial
 #     - noise_selection
 #     - forward_selection
+#     - permutation_selection
