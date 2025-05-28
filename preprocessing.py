@@ -9,19 +9,7 @@ import pandas as pd
 import multiprocessing
 import glob
 import tempfile
-from abc import ABC, abstractmethod
 
-# pyspark
-import pyspark # type: ignore
-from pyspark.sql import SparkSession, DataFrame # type: ignore
-from pyspark.sql import functions as F # type: ignore
-from pyspark.sql import types as T # type: ignore
-from pyspark.sql.functions import pandas_udf, col # type: ignore
-from pyspark.ml.feature import StringIndexer, StringIndexerModel # type: ignore
-from pyspark.ml.feature import VectorAssembler, StandardScaler, StandardScalerModel, MinMaxScaler, MinMaxScalerModel # type: ignore
-from pyspark.ml import Pipeline # type: ignore
-
-# sklearn
 import sklearn
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import (
@@ -30,24 +18,24 @@ from sklearn.preprocessing import (
     QuantileTransformer,
     KBinsDiscretizer
 )
-from sklearn.metrics import roc_auc_score
-
-# category_encoders
+from sklearn.metrics import roc_auc_score, mean_squared_error
 from category_encoders.ordinal import OrdinalEncoder
 from category_encoders.target_encoder import TargetEncoder
-from category_encoders.cat_boost import CatBoostEncoder
 
-# локальные модули
-from selectors.corr_feature_remover import CorrFeatureRemover
-from selectors.adversarial_feature_remover import AdversarialFeatureRemover
-from selectors.noise_feature_selector import NoiseFeatureSelector
-from selectors.forward_selection import ForwardFeatureSelector
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+from pyspark.sql.functions import pandas_udf, col
+
+from feature_selectors import (
+    BaseFeatureSelector,
+    CorrFeatureRemover,
+    AdversarialFeatureRemover,
+    NoiseFeatureSelector,
+    ForwardFeatureSelector
+)
 
 sklearn.set_config(transform_output='pandas')
-
-# Включаем поддержку Arrow для ускорения передачи данных между Spark и pandas
-spark_conf = pyspark.SparkConf()
-spark_conf.set('spark.sql.execution.arrow.enabled', 'true')
 
 # ===== Вспомогательные функции для работы с файлами и данными =====
 
@@ -147,27 +135,6 @@ def get_transform_udf(col_names, scaler):
     return transform_pdf
 
 
-class FeatureSelector(ABC):
-    """
-    Базовый интерфейс для классов, которые должны определять,
-    какие фичи стоит исключить или, наоборот, оставить.
-    """
-
-    @abstractmethod
-    def get_features_to_exclude(self, train_sdf, test_sdf=None, features=None, categorical_features=None):
-        """
-        Возвращает список фичей, которые необходимо исключить.
-        """
-        pass
-
-    @abstractmethod
-    def get_features_to_include(self, train_sdf, test_sdf=None, features=None, categorical_features=None):
-        """
-        Возвращает список фичей, которые необходимо включить.
-        """
-        pass
-
-
 class PreprocessingPipeline:
     """
     Класс для предобработки данных на Spark DataFrame.
@@ -194,9 +161,15 @@ class PreprocessingPipeline:
         self.clear_artifacts = bool(self.config["artifacts"]["clear"])
         ensure_dir_exists(self.artifacts_path)
 
+        self.sampling = self.config["sampling"]
+        self.train_sample_size = self.sampling.get('train_sample_size', None)
+        self.test_sample_size = self.sampling.get('test_sample_size', None)
+        self.use_sampling = self.sampling.get('use_sampling', False)
+
         # Основные настройки
         self.index_col = self.config["common"]["index_col"]
         self.target_col = self.config["common"].get("target_col")
+        self.task_type = self.config["common"].get("task_type", "binary_classification")
         self.skip_cols = set(self.config["common"].get("skip_cols", []))
         self.force_drop_cols = set(self.config["common"].get("force_drop_cols", []))
 
@@ -225,6 +198,16 @@ class PreprocessingPipeline:
         self.final_features_list = []
 
         # Пути к артефактам
+        self.artifacts_info = {
+            "drop_forced_cols_path": None,
+            "drop_uninformative_cols_path": None,
+            "drop_correlated_cols_path": None,
+            "drop_adversarial_cols_path": None,
+            "noise_excluded_cols_path": None,
+            "fs_excluded_cols_path": None,
+            "encoder_path": None,
+            "scaler_path": None
+        }
 
         # DataFrame для обучения/тестирования/скоринга
         self.train_sdf = None
@@ -250,6 +233,23 @@ class PreprocessingPipeline:
         self.test_sdf = valid_sdf
         self.scoring_sdf = scoring_sdf
 
+        # Сэмплируем данные
+        if self.use_sampling:
+            if self.train_sample_size:
+                fraction = 1.0
+                cnt = self.train_sdf.count()
+                if self.train_sample_size and int(self.train_sample_size) < cnt:
+                    fraction = self.train_sample_size / float(cnt)
+                self.train_sdf = self.train_sdf.sample(withReplacement=False, fraction=fraction, seed=42)
+                print(f"[Sampling] train size: {self.train_sdf.count()}")
+            if self.test_sample_size:
+                fraction = 1.0
+                cnt = self.test_sdf.count()
+                if self.test_sample_size and int(self.test_sample_size) < cnt:
+                    fraction = self.test_sample_size / float(cnt)
+                self.test_sdf = self.test_sdf.sample(withReplacement=False, fraction=fraction, seed=42)
+                print(f"[Sampling] test size: {self.test_sdf.count()}")
+
         # Инициализация списков колонок
         self._init_column_lists()
 
@@ -266,12 +266,14 @@ class PreprocessingPipeline:
             if step == "rebalancing":
                 continue  # Уже обработано
             elif step in self.preprocessing_methods:
+                print(f"Start processing step: {step}")
                 method = self.preprocessing_methods[step]
                 method(self)
             else:
                 print(f"[WARN] Неизвестный шаг пайплайна: {step}")
 
         # Сохранение информации и результатов
+        self.save_artifacts_info()
         self.save_results()
 
         return self.train_sdf, self.test_sdf, self.scoring_sdf
@@ -324,7 +326,7 @@ class PreprocessingPipeline:
             # Сохраняем список удаленных колонок
             path = os.path.join(self.artifacts_path, "drop_forced_cols.txt")
             save_columns(cols_to_drop, path)
-            print(f"[Artefact] Список удалённых колонок сохранён: {path}")
+            self.artifacts_info["drop_forced_cols_path"] = path
 
             # Обновляем списки колонок
             self._remove_cols_from_lists(self.force_drop_cols)
@@ -424,7 +426,7 @@ class PreprocessingPipeline:
             # Сохраняем список удаленных колонок
             path = os.path.join(self.artifacts_path, "drop_uninformative_cols.txt")
             save_columns(found_cols, path)
-            print(f"[Artefact] Список неинформативных колонок сохранён: {path}")
+            self.artifacts_info["drop_uninformative_cols_path"] = path
 
             # Обновляем списки колонок
             self._remove_cols_from_lists(found_cols)
@@ -453,25 +455,23 @@ class PreprocessingPipeline:
             # Разделяем обратно на train и test
             self.train_sdf = unique_sdf.filter(F.col('is_train_')==1).drop('is_train_')
             self.test_sdf = unique_sdf.filter(F.col('is_train_')==0).drop('is_train_')
-
             print(f"[deduplicate] Удалено {removed} строк из train и test")
+
         else:
             # Дедупликация только для train
             initial_count = self.train_sdf.count()
             self.train_sdf = self.train_sdf.dropDuplicates(subset=subset)
             final_count = self.train_sdf.count()
             removed = initial_count - final_count
-
             print(f"[deduplicate] Удалено {removed} строк из train")
 
         # Дедупликация scoring датасета (отдельно)
-        if self.scoring_sdf is not None:
-            initial_count = self.scoring_sdf.count()
-            self.scoring_sdf = self.scoring_sdf.dropDuplicates(subset=subset)
-            final_count = self.scoring_sdf.count()
-            removed = initial_count - final_count
-
-            print(f"[deduplicate] Удалено {removed} строк из scoring")
+        # if self.scoring_sdf is not None:
+        #     initial_count = self.scoring_sdf.count()
+        #     self.scoring_sdf = self.scoring_sdf.dropDuplicates(subset=subset)
+        #     final_count = self.scoring_sdf.count()
+        #     removed = initial_count - final_count
+        #     print(f"[deduplicate] Удалено {removed} строк из scoring")
 
     def categorical_encoding(self):
         """Кодирование категориальных признаков"""
@@ -485,67 +485,22 @@ class PreprocessingPipeline:
 
         encoder_path = os.path.join(self.artifacts_path, "encoder.pkl")
 
+        # Обучаем энкодер на train датасете
         sample_size = self.config["preprocessing"]["categorical_encoding"].get("sample_size")
 
         if sample_size:
             train_sample_pdf = self._sample_for_fit(self.train_sdf, cat_cols, sample_size=sample_size)
         else:
-            # Используем Arrow для toPandas
             train_sample_pdf = self.train_sdf.toPandas()
 
         if method == "label_encoder":
-            # Используем Spark ML StringIndexer
-            stages = []
-            for c in cat_cols:
-                stages.append(StringIndexer(inputCol=c, outputCol=f"{c}_index", handleInvalid="keep"))
-            pipeline = Pipeline(stages=stages)
-            model = pipeline.fit(self.train_sdf)
-            model.write().overwrite().save(encoder_path)
-            print(f"[Artefact] Spark StringIndexer сохранён: {encoder_path}")
-            # Применяем к train/test/scoring
-            for attr in ["train_sdf", "test_sdf", "scoring_sdf"]:
-                sdf = getattr(self, attr)
-                if sdf is not None:
-                    sdf = model.transform(sdf)
-                    # Заменяем оригинальные колонки на индексированные
-                    for c in cat_cols:
-                        sdf = sdf.drop(c).withColumnRenamed(f"{c}_index", c)
-                    setattr(self, attr, sdf)
+            self.encoder = OrdinalEncoder(cols=cat_cols, drop_invariant=True, handle_unknown='value')
+            self.encoder.fit(train_sample_pdf[cat_cols])
         elif method == "target_encoder":
             self.encoder = TargetEncoder(min_samples_leaf=100, smoothing=10.0)
             self.encoder.fit(train_sample_pdf[cat_cols], train_sample_pdf[self.target_col])
-            with open(encoder_path, 'wb') as f:
-                pickle.dump(self.encoder, f)
-            print(f"[Artefact] TargetEncoder сохранён: {encoder_path}")
-            # Применяем через pandas_udf
-            func = get_target_encoder_udf(cat_cols, encoder=self.encoder)
-            for attr in ["train_sdf", "test_sdf", "scoring_sdf"]:
-                sdf = getattr(self, attr)
-                if sdf is not None:
-                    fields = [T.StructField(f.name, T.FloatType(), True) if f.name in cat_cols else f for f in sdf.schema.fields]
-                    schema = T.StructType(fields)
-                    sdf = sdf.mapInPandas(func, schema=schema)
-                    setattr(self, attr, sdf)
-            # Переводим cat_cols в num_cols
-            for c in cat_cols:
-                if c in self.cat_cols:
-                    self.cat_cols.remove(c)
-                if c not in self.num_cols:
-                    self.num_cols.append(c)
-        elif method == "catboost_encoder":
-            self.encoder = CatBoostEncoder(cols=cat_cols)
-            self.encoder.fit(train_sample_pdf[cat_cols], train_sample_pdf[self.target_col])
-            with open(encoder_path, 'wb') as f:
-                pickle.dump(self.encoder, f)
-            print(f"[Artefact] CatBoostEncoder сохранён: {encoder_path}")
-            func = get_target_encoder_udf(cat_cols, encoder=self.encoder)
-            for attr in ["train_sdf", "test_sdf", "scoring_sdf"]:
-                sdf = getattr(self, attr)
-                if sdf is not None:
-                    fields = [T.StructField(f.name, T.FloatType(), True) if f.name in cat_cols else f for f in sdf.schema.fields]
-                    schema = T.StructType(fields)
-                    sdf = sdf.mapInPandas(func, schema=schema)
-                    setattr(self, attr, sdf)
+
+            # При target_encoding считаем фичи числовыми
             for c in cat_cols:
                 if c in self.cat_cols:
                     self.cat_cols.remove(c)
@@ -553,6 +508,44 @@ class PreprocessingPipeline:
                     self.num_cols.append(c)
         else:
             raise ValueError(f"Неизвестный метод кодирования: {method}")
+
+        # Сохраняем энкодер
+        ensure_dir_exists(os.path.dirname(encoder_path))
+        with open(encoder_path, 'wb') as f:
+            pickle.dump(self.encoder, f)
+        self.artifacts_info["encoder_path"] = encoder_path
+
+        # Подготовка UDF для трансформации
+        if method == "label_encoder":
+            fields = [T.StructField(f.name, T.IntegerType(), True) if f.name in cat_cols else f
+                     for f in self.train_sdf.schema.fields]
+            schema = T.StructType(fields)
+            func = get_ordinal_encoder_udf(cat_cols, encoder=self.encoder)
+        elif method == "target_encoder":
+            fields = [T.StructField(f.name, T.FloatType(), True) if f.name in cat_cols else f
+                     for f in self.train_sdf.schema.fields]
+            schema = T.StructType(fields)
+            func = get_target_encoder_udf(cat_cols, encoder=self.encoder)
+
+        # Применяем трансформацию ко всем датасетам
+        if self.train_sdf is not None:
+            self.train_sdf = self.train_sdf.mapInPandas(func, schema=schema)
+        if self.test_sdf is not None:
+            # Для test используем схему из train
+            test_fields = [T.StructField(f.name,
+                                         next((field.dataType for field in fields if field.name == f.name), f.dataType),
+                                         True)
+                           for f in self.test_sdf.schema.fields]
+            test_schema = T.StructType(test_fields)
+            self.test_sdf = self.test_sdf.mapInPandas(func, schema=test_schema)
+        if self.scoring_sdf is not None:
+            # Для scoring используем схему из train
+            scoring_fields = [T.StructField(f.name,
+                                           next((field.dataType for field in fields if field.name == f.name), f.dataType),
+                                           True)
+                              for f in self.scoring_sdf.schema.fields]
+            scoring_schema = T.StructType(scoring_fields)
+            self.scoring_sdf = self.scoring_sdf.mapInPandas(func, schema=scoring_schema)
 
     def scaling(self):
         """Масштабирование числовых признаков"""
@@ -564,6 +557,7 @@ class PreprocessingPipeline:
 
         scaler_path = os.path.join(self.artifacts_path, "scaler.pkl")
 
+        # Обучаем скейлер на train датасете
         sample_size = self.config["preprocessing"]["scaling"].get("sample_size")
 
         if sample_size:
@@ -574,69 +568,46 @@ class PreprocessingPipeline:
         method = self.config["preprocessing"]["scaling"]["method"]
 
         if method == "standard":
-            # Spark ML StandardScaler
-            assembler = VectorAssembler(inputCols=num_cols, outputCol="features_vec")
-            scaler = StandardScaler(inputCol="features_vec", outputCol="scaled_features", withMean=True, withStd=True)
-            pipeline = Pipeline(stages=[assembler, scaler])
-            model = pipeline.fit(self.train_sdf)
-            model.write().overwrite().save(scaler_path)
-            print(f"[Artefact] Spark StandardScaler сохранён: {scaler_path}")
-            for attr in ["train_sdf", "test_sdf", "scoring_sdf"]:
-                sdf = getattr(self, attr)
-                if sdf is not None:
-                    sdf = model.transform(sdf)
-                    # Разворачиваем scaled_features обратно в колонки
-                    for i, c in enumerate(num_cols):
-                        sdf = sdf.withColumn(c, col("scaled_features")[i])
-                    sdf = sdf.drop("features_vec", "scaled_features")
-                    setattr(self, attr, sdf)
+            self.scaler = StandardScaler()
         elif method == "minmax":
-            assembler = VectorAssembler(inputCols=num_cols, outputCol="features_vec")
-            scaler = MinMaxScaler(inputCol="features_vec", outputCol="scaled_features")
-            pipeline = Pipeline(stages=[assembler, scaler])
-            model = pipeline.fit(self.train_sdf)
-            model.write().overwrite().save(scaler_path)
-            print(f"[Artefact] Spark MinMaxScaler сохранён: {scaler_path}")
-            for attr in ["train_sdf", "test_sdf", "scoring_sdf"]:
-                sdf = getattr(self, attr)
-                if sdf is not None:
-                    sdf = model.transform(sdf)
-                    for i, c in enumerate(num_cols):
-                        sdf = sdf.withColumn(c, col("scaled_features")[i])
-                    sdf = sdf.drop("features_vec", "scaled_features")
-                    setattr(self, attr, sdf)
+            self.scaler = MinMaxScaler()
         elif method == "quantile":
             self.scaler = QuantileTransformer(output_distribution='uniform', random_state=42)
-            self.scaler.fit(train_sample_pdf[num_cols])
-            with open(scaler_path, 'wb') as f:
-                pickle.dump(self.scaler, f)
-            print(f"[Artefact] QuantileTransformer сохранён: {scaler_path}")
-            transform_func = get_transform_udf(num_cols, scaler=self.scaler)
-            for attr in ["train_sdf", "test_sdf", "scoring_sdf"]:
-                sdf = getattr(self, attr)
-                if sdf is not None:
-                    fields = [T.StructField(f.name, T.FloatType(), True) if f.name in num_cols else f for f in sdf.schema.fields]
-                    schema = T.StructType(fields)
-                    sdf = sdf.mapInPandas(transform_func, schema=schema)
-                    setattr(self, attr, sdf)
         elif method == "binning":
-            from sklearn.preprocessing import KBinsDiscretizer
             bins = self.config["preprocessing"]["scaling"].get("bins", 10)
             self.scaler = KBinsDiscretizer(n_bins=bins, encode='ordinal', strategy='uniform')
-            self.scaler.fit(train_sample_pdf[num_cols])
-            with open(scaler_path, 'wb') as f:
-                pickle.dump(self.scaler, f)
-            print(f"[Artefact] KBinsDiscretizer сохранён: {scaler_path}")
-            transform_func = get_transform_udf(num_cols, scaler=self.scaler)
-            for attr in ["train_sdf", "test_sdf", "scoring_sdf"]:
-                sdf = getattr(self, attr)
-                if sdf is not None:
-                    fields = [T.StructField(f.name, T.FloatType(), True) if f.name in num_cols else f for f in sdf.schema.fields]
-                    schema = T.StructType(fields)
-                    sdf = sdf.mapInPandas(transform_func, schema=schema)
-                    setattr(self, attr, sdf)
         else:
             raise ValueError(f"Неизвестный метод масштабирования: {method}")
+
+        self.scaler.fit(train_sample_pdf[num_cols])
+
+        # Сохраняем скейлер
+        ensure_dir_exists(os.path.dirname(scaler_path))
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(self.scaler, f)
+        self.artifacts_info["scaler_path"] = scaler_path
+
+        # Подготовка UDF для трансформации
+        transform_func = get_transform_udf(num_cols, scaler=self.scaler)
+
+        # Применяем трансформацию ко всем датасетам
+        if self.train_sdf is not None:
+            fields = [T.StructField(f.name, T.FloatType(), True) if f.name in num_cols else f
+                     for f in self.train_sdf.schema.fields]
+            schema = T.StructType(fields)
+            self.train_sdf = self.train_sdf.mapInPandas(transform_func, schema=schema)
+
+        if self.test_sdf is not None:
+            test_fields = [T.StructField(f.name, T.FloatType(), True) if f.name in num_cols else f
+                          for f in self.test_sdf.schema.fields]
+            test_schema = T.StructType(test_fields)
+            self.test_sdf = self.test_sdf.mapInPandas(transform_func, schema=test_schema)
+
+        if self.scoring_sdf is not None:
+            scoring_fields = [T.StructField(f.name, T.FloatType(), True) if f.name in num_cols else f
+                             for f in self.scoring_sdf.schema.fields]
+            scoring_schema = T.StructType(scoring_fields)
+            self.scoring_sdf = self.scoring_sdf.mapInPandas(transform_func, schema=scoring_schema)
 
     def drop_correlated(self):
         """Удаление сильно коррелирующих признаков"""
@@ -660,7 +631,7 @@ class PreprocessingPipeline:
             # Сохраняем список исключенных признаков
             path = os.path.join(self.artifacts_path, "drop_correlated_cols.txt")
             save_columns(features_to_exclude, path)
-            print(f"[Artefact] Список коррелирующих колонок сохранён: {path}")
+            self.artifacts_info["drop_correlated_cols_path"] = path
 
             # Обновляем списки колонок
             self._remove_cols_from_lists(features_to_exclude)
@@ -692,7 +663,7 @@ class PreprocessingPipeline:
             # Сохраняем список исключенных признаков
             path = os.path.join(self.artifacts_path, "drop_adversarial_cols.txt")
             save_columns(features_to_exclude, path)
-            print(f"[Artefact] Список adversarial колонок сохранён: {path}")
+            self.artifacts_info["drop_adversarial_cols_path"] = path
 
             # Обновляем списки колонок
             self._remove_cols_from_lists(features_to_exclude)
@@ -727,7 +698,7 @@ class PreprocessingPipeline:
             # Сохраняем список исключенных признаков
             path = os.path.join(self.artifacts_path, "noise_excluded_cols.txt")
             save_columns(features_to_exclude, path)
-            print(f"[Artefact] Список noise-исключённых колонок сохранён: {path}")
+            self.artifacts_info["noise_excluded_cols_path"] = path
 
             # Обновляем списки колонок
             self._remove_cols_from_lists(features_to_exclude)
@@ -762,7 +733,7 @@ class PreprocessingPipeline:
             # Сохраняем список исключенных признаков
             path = os.path.join(self.artifacts_path, "fs_excluded_cols.txt")
             save_columns(features_to_exclude, path)
-            print(f"[Artefact] Список fs-исключённых колонок сохранён: {path}")
+            self.artifacts_info["fs_excluded_cols_path"] = path
 
             # Обновляем списки колонок
             self._remove_cols_from_lists(features_to_exclude)
@@ -829,10 +800,12 @@ class PreprocessingPipeline:
 
         with open(self.path_features, 'w') as f:
             f.write('\n'.join(self.final_features_list))
-        print(f"[Artefact] Финальный список признаков сохранён: {self.path_features}")
+
         with open(self.path_categorical, 'w') as f:
             f.write('\n'.join(self.cat_cols))
-        print(f"[Artefact] Финальный список категориальных признаков сохранён: {self.path_categorical}")
+
+        print(f"[Feature list] всего признаков: {len(self.final_features_list)}, "
+              f"категориальных: {len(self.cat_cols)}")
 
     def _check_data_loaded(self):
         """Проверка, что данные загружены"""
@@ -876,35 +849,50 @@ class PreprocessingPipeline:
 
     def save_results(self):
         """Сохранение результатов обработки для train, test и scoring"""
+        # Сохраняем train и test
         fmt = self.config["result"]["format"]
-        train_path = self.config["result"].get("train_save_path")
-        test_path = self.config["result"].get("test_save_path")
-        scoring_path = self.config["result"].get("scoring_save_path")
+        save_path = self.config["result"]["save_path"]
+        suffix = self.config["result"].get("suffix", "_preprocessed")
 
         if fmt == "parquet":
-            if self.train_sdf is not None and train_path:
-                ensure_dir_exists(os.path.dirname(train_path))
-                self.save_data(self.train_sdf, fmt, train_path)
-            if self.test_sdf is not None and test_path:
-                ensure_dir_exists(os.path.dirname(test_path))
-                self.save_data(self.test_sdf, fmt, test_path)
+            # Для parquet save_path - это путь к директории
+            ensure_dir_exists(save_path)
+            train_output_path = f"{save_path}/train{suffix}.parquet"
+            test_output_path = f"{save_path}/test{suffix}.parquet"
+
+            if self.train_sdf is not None:
+                self.save_data(self.train_sdf, fmt, train_output_path)
+            if self.test_sdf is not None:
+                self.save_data(self.test_sdf, fmt, test_output_path)
         elif fmt == "hive":
-            if self.train_sdf is not None and train_path:
-                self.save_data(self.train_sdf, fmt, train_path)
-            if self.test_sdf is not None and test_path:
-                self.save_data(self.test_sdf, fmt, test_path)
+            # Для hive save_path - это имя таблицы
+            train_table_name = f"{save_path}.train{suffix}"
+            test_table_name = f"{save_path}.test{suffix}"
+
+            if self.train_sdf is not None:
+                self.save_data(self.train_sdf, fmt, train_table_name)
+            if self.test_sdf is not None:
+                self.save_data(self.test_sdf, fmt, test_table_name)
         else:
             raise ValueError(f"Неизвестный формат сохранения: {fmt}")
 
-        if self.scoring_sdf is not None and scoring_path:
-            fmt_scoring = self.config["result"].get("format_scoring", fmt)
+        # Сохраняем scoring
+        if self.scoring_sdf is not None:
+            fmt_scoring = self.config["result"].get("format_scoring", "parquet")
+            save_path_scoring = self.config["result"].get("save_path_scoring", "")
+
             if fmt_scoring == "parquet":
-                ensure_dir_exists(os.path.dirname(scoring_path))
-                self.save_data(self.scoring_sdf, fmt_scoring, scoring_path)
+                # Для parquet save_path_scoring - это путь к директории
+                ensure_dir_exists(save_path_scoring)
+                scoring_output_path = f"{save_path_scoring}/scoring{suffix}.parquet"
+                self.save_data(self.scoring_sdf, fmt_scoring, scoring_output_path)
             elif fmt_scoring == "hive":
-                self.save_data(self.scoring_sdf, fmt_scoring, scoring_path)
+                # Для hive save_path_scoring - это имя таблицы
+                scoring_table_name = f"{save_path_scoring}.scoring{suffix}"
+                self.save_data(self.scoring_sdf, fmt_scoring, scoring_table_name)
             else:
                 raise ValueError(f"Неизвестный формат сохранения для scoring: {fmt_scoring}")
+
             print(f"[INFO] Данные scoring сохранены (формат: {fmt_scoring})")
 
         print(f"Окончательный список признаков в файле: {self.path_features}")
@@ -918,10 +906,19 @@ class PreprocessingPipeline:
             pdf.to_parquet(name)
             print(f"[INFO] Данные сохранены в файл {name}")
         elif fmt == 'hive':
+            self.sqlContext.sql(f'DROP TABLE IF EXISTS {name} PURGE')
             data.write.mode("overwrite").saveAsTable(name)
             print(f"[INFO] Данные сохранены в hive-таблицу {name}")
         else:
             raise ValueError(f"Неизвестный формат сохранения: {fmt}")
+
+    def save_artifacts_info(self):
+        """Сохранение информации об артефактах"""
+        artifacts_json_path = os.path.join(self.artifacts_path, "artifacts_info.json")
+        ensure_dir_exists(os.path.dirname(artifacts_json_path))
+        with open(artifacts_json_path, "w", encoding='utf-8') as f:
+            json.dump(self.artifacts_info, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] Сохранена информация об артефактах")
 
     # Словарь методов для динамического вызова по имени шага
     preprocessing_methods = {
@@ -940,7 +937,7 @@ class PreprocessingPipeline:
 
 
 if __name__ == '__main__':
-    from campaignds.sc_connector import SparkHelper # type: ignore
+    from campaignds.sc_connector import SparkHelper
 
     helper = SparkHelper(
         dynamicAllocation='True',
