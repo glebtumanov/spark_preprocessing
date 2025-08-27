@@ -499,7 +499,7 @@ class PreprocessingPipeline:
             self.encoder = OrdinalEncoder(cols=cat_cols, drop_invariant=True, handle_unknown='value')
             self.encoder.fit(train_sample_pdf[cat_cols])
         elif method == "target_encoder":
-            self.encoder = TargetEncoder(min_samples_leaf=100, smoothing=10.0)
+            self.encoder = TargetEncoder(min_samples_leaf=100, smoothing=20.0)
             self.encoder.fit(train_sample_pdf[cat_cols], train_sample_pdf[self.target_col])
 
             # При target_encoding считаем фичи числовыми

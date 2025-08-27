@@ -7,15 +7,17 @@ from .feature_selectors import (
     AdversarialFeatureRemover,
     CorrFeatureRemover,
     ForwardFeatureSelector,
-    NoiseFeatureSelector
+    NoiseFeatureSelector,
+    PermutationSelector
 )
 from .preprocessing import PreprocessingPipeline
 
 __all__ = [
     "BaseFeatureSelector",
-    "AdversarialFeatureRemover", 
+    "AdversarialFeatureRemover",
     "CorrFeatureRemover",
     "ForwardFeatureSelector",
     "NoiseFeatureSelector",
     "PreprocessingPipeline",
+    "PermutationSelector"
 ]

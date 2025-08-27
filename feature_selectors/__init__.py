@@ -7,11 +7,13 @@ from .adversarial_feature_remover import AdversarialFeatureRemover
 from .corr_feature_remover import CorrFeatureRemover
 from .forward_selection import ForwardFeatureSelector
 from .noise_feature_selector import NoiseFeatureSelector
+from .permutation_selector import PermutationSelector
 
 __all__ = [
     'BaseFeatureSelector',
-    'AdversarialFeatureRemover', 
+    'AdversarialFeatureRemover',
     'CorrFeatureRemover',
     'ForwardFeatureSelector',
-    'NoiseFeatureSelector'
-] 
+    'NoiseFeatureSelector',
+    'PermutationSelector'
+]
