@@ -323,13 +323,13 @@ class CorrFeatureRemover(BaseFeatureSelector):
         skip_cols = set(self.config["common"].get("skip_cols", []))
 
         # Собираем cat_cols, num_cols (логика может быть чуть другой, как в твоём коде)
-        cat_cols, num_cols = self._split_cols_by_type(train_sdf, index_col, target_col, skip_cols)
-        features = cat_cols + num_cols
+        # cat_cols, num_cols = self._split_cols_by_type(train_sdf, index_col, target_col, skip_cols)
+        # features = cat_cols + num_cols
         if not features:
             return []
 
         # Считаем importances_dict (или shap)
-        importances_dict = self.get_feature_scores(train_sdf, features, cat_cols)
+        importances_dict = self.get_feature_scores(train_sdf, features, categorical_features)
         if not importances_dict:
             # Если не получилось посчитать — возвращаем пустой список
             return []

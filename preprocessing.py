@@ -185,6 +185,8 @@ class PreprocessingPipeline:
         # Трансформеры
         self.encoder = None
         self.scaler = None
+        # Флаг: выполнено ли кодирование категориальных признаков
+        self.is_categorical_encoded = False
 
         # Списки колонок для удаления
         self.uninformative_cols = []
@@ -210,6 +212,10 @@ class PreprocessingPipeline:
             "encoder_path": None,
             "scaler_path": None
         }
+
+        # Пути для финальных списков признаков
+        self.path_features = os.path.join(self.artifacts_path, "final_feature_list.txt")
+        self.path_categorical = os.path.join(self.artifacts_path, "final_categorical_list.txt")
 
         # DataFrame для обучения/тестирования/скоринга
         self.train_sdf = None
@@ -548,6 +554,11 @@ class PreprocessingPipeline:
                               for f in self.scoring_sdf.schema.fields]
             scoring_schema = T.StructType(scoring_fields)
             self.scoring_sdf = self.scoring_sdf.mapInPandas(func, schema=scoring_schema)
+        # Отмечаем, что кодирование категориальных признаков выполнено
+        self.is_categorical_encoded = True
+
+        # После изменения списков признаков/типов фиксируем артефакты
+        self._persist_feature_lists()
 
     def scaling(self):
         """Масштабирование числовых признаков"""
@@ -616,8 +627,18 @@ class PreprocessingPipeline:
         self._check_data_loaded()
         selector = CorrFeatureRemover(self.config, self.sc)
 
-        # Получаем список признаков для исключения
-        features_to_exclude = selector.get_features_to_exclude(train_sdf=self.train_sdf)
+        # Используем только числовые признаки для корреляционного анализа
+        features = self._get_numeric_features_for_modeling()
+        if not features:
+            print("[drop_correlated] Нет числовых признаков для анализа, шаг пропущен")
+            return
+
+        # Получаем список признаков для исключения (категориальные не используются здесь)
+        features_to_exclude = selector.get_features_to_exclude(
+            train_sdf=self.train_sdf,
+            features=features,
+            categorical_features=[]
+        )
 
         if features_to_exclude:
             print(f"[drop_correlated] Удаляем колонки: {len(features_to_exclude)}")
@@ -644,11 +665,22 @@ class PreprocessingPipeline:
         selector = AdversarialFeatureRemover(self.config, self.sc)
 
         # Получаем список признаков для исключения (scoring не участвует)
+        if self.is_categorical_encoded:
+            features = self.final_features_list
+            categorical_features = self.cat_cols
+        else:
+            features = self._get_numeric_features_for_modeling()
+            categorical_features = []
+
+        if not features:
+            print("[drop_adversarial] Нет признаков для анализа, шаг пропущен")
+            return
+
         features_to_exclude = selector.get_features_to_exclude(
             train_sdf=self.train_sdf,
             test_sdf=self.test_sdf,
-            features=self.final_features_list,
-            categorical_features=self.cat_cols
+            features=features,
+            categorical_features=categorical_features
         )
 
         if features_to_exclude:
@@ -676,15 +708,26 @@ class PreprocessingPipeline:
         selector = NoiseFeatureSelector(self.config, self.sc)
 
         # Получаем список признаков для включения
+        if self.is_categorical_encoded:
+            features = self.final_features_list
+            categorical_features = self.cat_cols
+        else:
+            features = self._get_numeric_features_for_modeling()
+            categorical_features = []
+
+        if not features:
+            print("[select_noise] Нет признаков для анализа, шаг пропущен")
+            return
+
         features_to_include = selector.get_features_to_include(
             train_sdf=self.train_sdf,
             test_sdf=None,
-            features=self.final_features_list,
-            categorical_features=self.cat_cols
+            features=features,
+            categorical_features=categorical_features
         )
 
-        # Получаем список признаков для исключения
-        features_to_exclude = [col for col in self.final_features_list if col not in features_to_include]
+        # Исключаем только из анализируемого множества features
+        features_to_exclude = [col for col in self.final_features_list if (col in features and col not in features_to_include)]
 
         if features_to_exclude:
             print(f"[select_noise] Удаляем колонки: {len(features_to_exclude)}")
@@ -711,15 +754,26 @@ class PreprocessingPipeline:
         selector = ForwardFeatureSelector(self.config, self.sc)
 
         # Получаем список признаков для включения
+        if self.is_categorical_encoded:
+            features = self.final_features_list
+            categorical_features = self.cat_cols
+        else:
+            features = self._get_numeric_features_for_modeling()
+            categorical_features = []
+
+        if not features:
+            print("[select_forward] Нет признаков для анализа, шаг пропущен")
+            return
+
         features_to_include = selector.get_features_to_include(
             train_sdf=self.train_sdf,
             test_sdf=None,
-            features=self.final_features_list,
-            categorical_features=self.cat_cols
+            features=features,
+            categorical_features=categorical_features
         )
 
-        # Получаем список признаков для исключения
-        features_to_exclude = [col for col in self.final_features_list if col not in features_to_include]
+        # Исключаем только из анализируемого множества features
+        features_to_exclude = [col for col in self.final_features_list if (col in features and col not in features_to_include)]
 
         if features_to_exclude:
             print(f"[select_forward] Удаляем колонки: {len(features_to_exclude)}")
@@ -746,15 +800,26 @@ class PreprocessingPipeline:
         selector = PermutationSelector(self.config, self.sc)
 
         # Получаем список признаков для включения
+        if self.is_categorical_encoded:
+            features = self.final_features_list
+            categorical_features = self.cat_cols
+        else:
+            features = self._get_numeric_features_for_modeling()
+            categorical_features = []
+
+        if not features:
+            print("[select_permutation] Нет признаков для анализа, шаг пропущен")
+            return
+
         features_to_include = selector.get_features_to_include(
             train_sdf=self.train_sdf,
             test_sdf=None,
-            features=self.final_features_list,
-            categorical_features=self.cat_cols
+            features=features,
+            categorical_features=categorical_features
         )
 
-        # Получаем список признаков для исключения
-        features_to_exclude = [col for col in self.final_features_list if col not in features_to_include]
+        # Исключаем только из анализируемого множества features
+        features_to_exclude = [col for col in self.final_features_list if (col in features and col not in features_to_include)]
 
         if features_to_exclude:
             print(f"[select_permutation] Удаляем колонки: {len(features_to_exclude)}")
@@ -818,6 +883,9 @@ class PreprocessingPipeline:
         self.num_cols = num_cols_local
         self.final_features_list = all_cols_local
 
+        # Сохраняем начальные списки, чтобы сформировать артефакты даже без шагов отбора/кодирования
+        self._persist_feature_lists()
+
     def _remove_cols_from_lists(self, cols_to_remove):
         """Удаляет колонки из списков и сохраняет обновленные списки"""
         for c in cols_to_remove:
@@ -827,11 +895,11 @@ class PreprocessingPipeline:
                 self.num_cols.remove(c)
             if c in self.final_features_list:
                 self.final_features_list.remove(c)
+        # Сохраняем обновленные списки через общий метод
+        self._persist_feature_lists()
 
-        # Сохраняем обновленные списки
-        self.path_features = os.path.join(self.artifacts_path, "final_feature_list.txt")
-        self.path_categorical = os.path.join(self.artifacts_path, "final_categorical_list.txt")
-
+    def _persist_feature_lists(self):
+        """Сохраняет текущие финальные списки признаков и категориальных признаков в артефакты."""
         ensure_dir_exists(os.path.dirname(self.path_features))
         ensure_dir_exists(os.path.dirname(self.path_categorical))
 
@@ -841,8 +909,13 @@ class PreprocessingPipeline:
         with open(self.path_categorical, 'w') as f:
             f.write('\n'.join(self.cat_cols))
 
-        print(f"[Feature list] всего признаков: {len(self.final_features_list)}, "
-              f"категориальных: {len(self.cat_cols)}")
+        print(
+            f"[Feature list] всего признаков: {len(self.final_features_list)}, категориальных: {len(self.cat_cols)}"
+        )
+
+    def _get_numeric_features_for_modeling(self):
+        """Возвращает список числовых признаков из текущего финального пула."""
+        return [c for c in self.final_features_list if c in self.num_cols]
 
     def _check_data_loaded(self):
         """Проверка, что данные загружены"""
