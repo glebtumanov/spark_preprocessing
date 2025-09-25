@@ -241,6 +241,10 @@ class PreprocessingPipeline:
         self.test_sdf = valid_sdf
         self.scoring_sdf = scoring_sdf
 
+        # Ребалансировка, если требуется
+        if "rebalancing" in self.pipeline_steps:
+            self.rebalancing_train()
+
         # Сэмплируем данные
         if self.use_sampling:
             if self.train_sample_size:
@@ -265,10 +269,6 @@ class PreprocessingPipeline:
         if self.clear_artifacts:
             self._clear_artifacts_folder()
 
-        # Ребалансировка, если требуется
-        if "rebalancing" in self.pipeline_steps:
-            self.rebalancing_train()
-
         # Выполнение шагов пайплайна
         for step in self.pipeline_steps:
             if step == "rebalancing":
@@ -285,6 +285,182 @@ class PreprocessingPipeline:
         self.save_results()
 
         return self.train_sdf, self.test_sdf, self.scoring_sdf
+
+    def apply_preprocessing(self, sdf: DataFrame):
+        """
+        Применяет сохранённый препроцессинг к произвольному Spark DataFrame и сохраняет результат
+        по правилам секции result (format_scoring, save_path_scoring).
+
+        Требуются артефакты, полученные на этапе run_preprocessing. Если необходимых артефактов
+        нет, генерируется понятная ошибка.
+        """
+        # 1) Проверяем наличие директории артефактов и ключевых файлов со списками признаков
+        if not os.path.isdir(self.artifacts_path):
+            raise FileNotFoundError(
+                f"Не найдена папка артефактов: {self.artifacts_path}. Сначала выполните обучение препроцессинга."
+            )
+
+        if not os.path.exists(self.path_features):
+            raise FileNotFoundError(
+                f"Не найден финальный список признаков: {self.path_features}. Выполните run_preprocessing."
+            )
+        if not os.path.exists(self.path_categorical):
+            raise FileNotFoundError(
+                f"Не найден список категориальных признаков: {self.path_categorical}. Выполните run_preprocessing."
+            )
+
+        final_features = load_columns(self.path_features)
+        categorical_features = load_columns(self.path_categorical)
+        if not final_features:
+            raise ValueError("Финальный список признаков пуст. Выполните run_preprocessing.")
+
+        # 2) Проверяем, что входной датафрейм содержит все нужные колонки
+        missing_features = [c for c in final_features if c not in sdf.columns]
+        if missing_features:
+            raise KeyError(
+                f"Входной DataFrame не содержит необходимые колонки для инференса: {missing_features}"
+            )
+
+        # 3) Загружаем информацию об артефактах (если есть) для определения путей к энкодеру/скейлеру
+        artifacts_info_path = os.path.join(self.artifacts_path, "artifacts_info.json")
+        artifacts_info = {}
+        if os.path.exists(artifacts_info_path):
+            with open(artifacts_info_path, "r", encoding="utf-8") as f:
+                artifacts_info = json.load(f)
+
+        encoder_path = artifacts_info.get("encoder_path") or os.path.join(self.artifacts_path, "encoder.pkl")
+        scaler_path = artifacts_info.get("scaler_path") or os.path.join(self.artifacts_path, "scaler.pkl")
+
+        df = sdf
+
+        # 4) Приведение Decimal -> Float (аналог convert_decimal, локально и только для данного df)
+        for field in df.schema.fields:
+            if isinstance(field.dataType, T.DecimalType):
+                df = df.withColumn(field.name, F.col(field.name).cast(T.FloatType()))
+
+        # 5) Заполнение пропусков по типам из артефактов (категориальные/числовые)
+        num_na_val = self.config["preprocessing"]["missing_values"]["numeric"]
+        cat_na_val = self.config["preprocessing"]["missing_values"]["categorical"]
+        fill_dict = {}
+        # Категориальные
+        for c in categorical_features:
+            if c in df.columns:
+                fill_dict[c] = cat_na_val
+        # Числовые: берём финальные признаки минус категориальные
+        for c in final_features:
+            if c not in categorical_features and c in df.columns:
+                fill_dict[c] = num_na_val
+        if fill_dict:
+            df = df.fillna(fill_dict)
+
+        # 6) Применяем кодирование, если есть артефакт энкодера
+        encoder_exists = os.path.exists(encoder_path)
+        cat_method = self.config["preprocessing"]["categorical_encoding"]["method"]
+
+        if encoder_exists:
+            with open(encoder_path, "rb") as f:
+                encoder = pickle.load(f)
+
+            # Берём список колонок для кодирования из артефакта энкодера, если доступен
+            encoder_cols = getattr(encoder, 'cols', None)
+            if encoder_cols is None or (isinstance(encoder_cols, list) and len(encoder_cols) == 0):
+                encoder_cols = categorical_features
+
+            # Пересекаем с финальными фичами и текущими колонками df
+            cats_required = [c for c in encoder_cols if (c in final_features and c in df.columns)]
+            missing_cats = [c for c in cats_required if c not in df.columns]
+            if missing_cats:
+                raise KeyError(
+                    f"Отсутствуют категориальные колонки, ожидаемые энкодером: {missing_cats}"
+                )
+
+            if cats_required:
+                if cat_method == "label_encoder":
+                    fields = [
+                        T.StructField(f.name, T.IntegerType(), True) if f.name in cats_required else f
+                        for f in df.schema.fields
+                    ]
+                    schema = T.StructType(fields)
+                    func = get_ordinal_encoder_udf(cats_required, encoder=encoder)
+                else:
+                    fields = [
+                        T.StructField(f.name, T.FloatType(), True) if f.name in cats_required else f
+                        for f in df.schema.fields
+                    ]
+                    schema = T.StructType(fields)
+                    func = get_target_encoder_udf(cats_required, encoder=encoder)
+
+                df = df.mapInPandas(func, schema=schema)
+        else:
+            # Файл энкодера может отсутствовать, если категориальных фичей не было вовсе
+            if len(categorical_features) > 0:
+                raise FileNotFoundError(
+                    f"Не найден файл энкодера: {encoder_path}, при этом список категориальных признаков не пуст."
+                )
+
+        # 7) Применяем масштабирование, если есть артефакт скейлера
+        scaler_exists = os.path.exists(scaler_path)
+        if scaler_exists:
+            with open(scaler_path, "rb") as f:
+                scaler = pickle.load(f)
+
+            # Пытаемся восстановить точный порядок колонок из артефакта скейлера
+            if hasattr(scaler, 'feature_names_in_') and scaler.feature_names_in_ is not None:
+                names = [str(x) for x in list(scaler.feature_names_in_)]
+                scale_cols = [c for c in names if c in df.columns]
+            else:
+                # Фоллбек, если имён нет в артефакте
+                # - при target_encoder все финальные признаки считаем числовыми
+                # - при label_encoder масштабируем только некатегориальные
+                if cat_method == "target_encoder":
+                    scale_cols = [c for c in final_features if c in df.columns]
+                else:
+                    scale_cols = [c for c in final_features if (c not in categorical_features) and (c in df.columns)]
+
+            missing_scale = [c for c in scale_cols if c not in df.columns]
+            if missing_scale:
+                raise KeyError(
+                    f"Отсутствуют числовые колонки для масштабирования: {missing_scale}"
+                )
+
+            if scale_cols:
+                fields = [
+                    T.StructField(f.name, T.FloatType(), True) if f.name in scale_cols else f
+                    for f in df.schema.fields
+                ]
+                schema = T.StructType(fields)
+                transform_func = get_transform_udf(scale_cols, scaler=scaler)
+                df = df.mapInPandas(transform_func, schema=schema)
+        else:
+            # Если скейлера нет, проверим — есть ли вообще что масштабировать
+            if cat_method == "target_encoder":
+                potential_scale_cols = [c for c in final_features if c in df.columns]
+            else:
+                potential_scale_cols = [c for c in final_features if (c not in categorical_features) and (c in df.columns)]
+
+            # Если шаг scaling указан и есть потенциальные числовые признаки — считаем это ошибкой артефактов
+            if "scaling" in self.pipeline_steps and len(potential_scale_cols) > 0:
+                raise FileNotFoundError(
+                    f"Не найден файл скейлера: {scaler_path}, при этом шаг 'scaling' указан и есть колонки для масштабирования."
+                )
+
+        # 8) Сохраняем результат как scoring-датасет
+        fmt_scoring = self.config["result"].get("format_scoring", "parquet")
+        save_path_scoring = self.config["result"].get("save_path_scoring", "")
+        suffix = self.config["result"].get("suffix", "_preprocessed")
+
+        if fmt_scoring == "parquet":
+            ensure_dir_exists(save_path_scoring)
+            output_name = f"{save_path_scoring}/scoring{suffix}.parquet"
+        elif fmt_scoring == "hive":
+            output_name = f"{save_path_scoring}.scoring{suffix}"
+        else:
+            raise ValueError(f"Неизвестный формат сохранения для scoring: {fmt_scoring}")
+
+        self.save_data(df, fmt_scoring, output_name)
+        print(f"[INFO] Данные scoring сохранены (формат: {fmt_scoring})")
+
+        return df
 
     # ============ Методы баланcировки ============
 
