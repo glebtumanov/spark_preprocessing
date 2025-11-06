@@ -26,6 +26,7 @@ from pyspark.sql import DataFrame # type: ignore
 from pyspark.sql import functions as F # type: ignore
 from pyspark.sql import types as T # type: ignore
 from pyspark.sql.functions import pandas_udf, col # type: ignore
+from pyspark.sql.window import Window # type: ignore
 
 from feature_selectors import (
     BaseFeatureSelector,
@@ -241,7 +242,7 @@ class PreprocessingPipeline:
         self.test_sdf = valid_sdf
         self.scoring_sdf = scoring_sdf
 
-        # Ребалансировка, если требуется
+        # Ребалансировка всегда выполняется ДО сэмплирования (если параметры валидны)
         if "rebalancing" in self.pipeline_steps:
             self.rebalancing_train()
 
@@ -458,27 +459,58 @@ class PreprocessingPipeline:
     # ============ Методы баланcировки ============
 
     def rebalancing_train(self):
-        """Ребалансировка данных обучающей выборки"""
-        if self.train_sdf is None:
-            print("[WARN] train_sdf не задан, ребалансировка невозможна")
+        """Ребалансировка: по умолчанию только train; опционально test по конфигу.
+        Выполняет перерасчёт доли классов без вспомогательных методов."""
+        cfg = self.config["preprocessing"]["rebalancing"]
+        p = cfg.get("positive_frac", 1.0)
+        apply_to = cfg.get("apply_to", "train")  # train|both|test
+        print(f"[rebalancing] target positive frac: {p}, apply_to={apply_to}")
+
+        if not (0.0 < p < 1.0):
+            print("[rebalancing][WARN] positive_frac должен быть в (0,1). Ребалансировка пропущена")
             return
 
-        positive_frac = self.config["preprocessing"]["rebalancing"].get("positive_frac", 1.0)
-        print(f"[rebalancing] new positive frac: {positive_frac}")
+        targets = []
+        if apply_to in ("train", "both"):
+            targets.append(("train", "train_sdf"))
+        if apply_to in ("test", "both") and self.test_sdf is not None:
+            targets.append(("test", "test_sdf"))
 
-        # Рассчитываем коэффициент для ребалансировки
-        pos_count = self.train_sdf.filter(F.col(self.target_col) == 1).count()
-        neg_count = self.train_sdf.filter(F.col(self.target_col) == 0).count()
-        neg_frac = pos_count * (1 / positive_frac) / neg_count
+        for name, attr in targets:
+            sdf = getattr(self, attr)
+            pos_count = sdf.filter(F.col(self.target_col) == 1).count()
+            neg_count = sdf.filter(F.col(self.target_col) == 0).count()
 
-        # Применяем ребалансировку
-        self.train_sdf = self.train_sdf.filter(
-            (F.col(self.target_col) == 1) | (F.rand() <= neg_frac)
-        )
+            if pos_count == 0 or neg_count == 0:
+                print(f"[rebalancing][WARN] {name}: один из классов пуст, пропущено")
+                continue
 
-        # Отображаем распределение целевой переменной
-        self.train_sdf.groupBy(self.target_col).agg(F.count(F.lit(1)).alias('cnt')).show()
-        print(f"[rebalancing] Ребалансировка завершена, итого строк: {self.train_sdf.count()}")
+            # Текущая доля положительного класса
+            current_frac = float(pos_count) / float(pos_count + neg_count)
+            if current_frac >= p:
+                print(f"[rebalancing] {name}: текущая доля {current_frac:.6f} ≥ {p:.6f}, пропускаем")
+                continue
+
+            # Считаем требуемое число негативов для точной доли p
+            needed_neg = int((pos_count * (1.0 - p)) // p)
+            if needed_neg > neg_count:
+                needed_neg = int(neg_count)
+
+            # Разделяем классы
+            pos_df = sdf.filter(F.col(self.target_col) == 1)
+            neg_df = sdf.filter(F.col(self.target_col) == 0)
+
+            if needed_neg <= 0:
+                sdf = pos_df
+            else:
+                # Детерминированно выбираем нужное число негативов
+                w = Window.orderBy(F.rand(seed=42))
+                neg_df = neg_df.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") <= F.lit(needed_neg)).drop("_rn")
+                sdf = pos_df.unionByName(neg_df)
+
+            sdf.groupBy(self.target_col).agg(F.count(F.lit(1)).alias('cnt')).show()
+            print(f"[rebalancing] {name}: завершено, итог строк: {sdf.count()} (needed_neg={needed_neg})")
+            setattr(self, attr, sdf)
 
     # ============ Методы предобработки данных ============
 
@@ -1093,6 +1125,29 @@ class PreprocessingPipeline:
         """Возвращает список числовых признаков из текущего финального пула."""
         return [c for c in self.final_features_list if c in self.num_cols]
 
+    def _select_final_columns_for_output(self, df: DataFrame) -> DataFrame:
+        """Возвращает DataFrame с ограничением по финальному списку признаков и служебным колонкам.
+
+        Оставляет только признаки из `final_features_list`, а также присутствующие служебные
+        колонки: `index_col`, `target_col` и `skip_cols`.
+        """
+        if df is None:
+            return df
+
+        cols_to_keep = set(self.final_features_list)
+
+        if self.index_col and self.index_col in df.columns:
+            cols_to_keep.add(self.index_col)
+        if self.target_col and self.target_col in df.columns:
+            cols_to_keep.add(self.target_col)
+        for c in self.skip_cols:
+            if c in df.columns:
+                cols_to_keep.add(c)
+
+        # Сохраняем порядок исходных колонок
+        selected_cols = [c for c in df.columns if c in cols_to_keep]
+        return df.select(*selected_cols)
+
     def _check_data_loaded(self):
         """Проверка, что данные загружены"""
         if self.train_sdf is None:
@@ -1166,16 +1221,17 @@ class PreprocessingPipeline:
         if self.scoring_sdf is not None:
             fmt_scoring = self.config["result"].get("format_scoring", "parquet")
             save_path_scoring = self.config["result"].get("save_path_scoring", "")
+            scoring_to_save = self._select_final_columns_for_output(self.scoring_sdf)
 
             if fmt_scoring == "parquet":
                 # Для parquet save_path_scoring - это путь к директории
                 ensure_dir_exists(save_path_scoring)
                 scoring_output_path = f"{save_path_scoring}/scoring{suffix}.parquet"
-                self.save_data(self.scoring_sdf, fmt_scoring, scoring_output_path)
+                self.save_data(scoring_to_save, fmt_scoring, scoring_output_path)
             elif fmt_scoring == "hive":
                 # Для hive save_path_scoring - это имя таблицы
                 scoring_table_name = f"{save_path_scoring}.scoring{suffix}"
-                self.save_data(self.scoring_sdf, fmt_scoring, scoring_table_name)
+                self.save_data(scoring_to_save, fmt_scoring, scoring_table_name)
             else:
                 raise ValueError(f"Неизвестный формат сохранения для scoring: {fmt_scoring}")
 

@@ -12,19 +12,20 @@ sampling:
     use_sampling: true   # Если поставить false, то сэмплирование делать не будем
 
 artifacts:
-    path: "/home/17126416_omega-sbrf-ru/data/artifacts_for_sota"
+    path: "/data/artifacts_for_sota"
     clear: false
 
 result:
     format: "parquet" # hive, parquet
-    save_path: "/home/17126416_omega-sbrf-ru/data/results" # path для parquet или имя таблицы для hive
+    save_path: "/data/results" # path для parquet или имя таблицы для hive
     format_scoring: "parquet" # hive, parquet
-    save_path_scoring: "/home/17126416_omega-sbrf-ru/data/results_scoring" # путь для parquet или имя таблицы для hive
+    save_path_scoring: "/data/results_scoring" # путь для parquet или имя таблицы для hive
     suffix: "_for_sota" # общий суффикс для всех сохраняемых данных
 
 preprocessing:
     rebalancing:
         positive_frac: 0.3
+        apply_to: both   # варианты: train (по умолчанию), test, both
     drop_uninformative:
         threshold: 0.99
     missing_values:
